@@ -12,21 +12,23 @@ logger = Logger(__name__)
 
 class ByteStreamer:
     def __init__(self, client: Client):
-        self.clean_timer = 15 * 60  # Reduced cache time for better memory management
+        self.clean_timer = 15 * 60  # 15 minutes
         self.client: Client = client
         self.cached_file_ids: Dict[int, FileId] = {}
         asyncio.create_task(self.clean_cache())
 
     async def get_file_properties(self, channel, message_id: int) -> FileId:
+        """Get file properties with caching"""
         try:
-        if message_id not in self.cached_file_ids:
-            await self.generate_file_properties(channel, message_id)
-        return self.cached_file_ids[message_id]
+            if message_id not in self.cached_file_ids:
+                await self.generate_file_properties(channel, message_id)
+            return self.cached_file_ids[message_id]
         except Exception as e:
             logger.error(f"Error getting file properties: {e}")
             return None
 
     async def generate_file_properties(self, channel, message_id: int) -> FileId:
+        """Generate and cache file properties"""
         try:
             file_id = await get_file_ids(self.client, channel, message_id)
             if not file_id:
@@ -34,15 +36,13 @@ class ByteStreamer:
             self.cached_file_ids[message_id] = file_id
             return self.cached_file_ids[message_id]
         except Exception as e:
-            logger.error(f"Error generating file properties: {e}")
+            logger.error(f"Error generating file properties for message {message_id}: {e}")
             raise
 
     async def generate_media_session(self, client: Client, file_id: FileId) -> Session:
         """
         Generates the media session for the DC that contains the media file.
-        This is required for getting the bytes from Telegram servers.
         """
-
         media_session = client.media_sessions.get(file_id.dc_id, None)
 
         if media_session is None:
@@ -71,9 +71,7 @@ class ByteStreamer:
                         )
                         break
                     except AuthBytesInvalid:
-                        logger.debug(
-                            f"Invalid authorization bytes for DC {file_id.dc_id}"
-                        )
+                        logger.debug(f"Invalid authorization bytes for DC {file_id.dc_id}")
                         continue
                 else:
                     await media_session.stop()
@@ -87,23 +85,17 @@ class ByteStreamer:
                     is_media=True,
                 )
                 await media_session.start()
+
             logger.debug(f"Created media session for DC {file_id.dc_id}")
             client.media_sessions[file_id.dc_id] = media_session
         else:
             logger.debug(f"Using cached media session for DC {file_id.dc_id}")
+
         return media_session
 
     @staticmethod
-    async def get_location(
-        file_id: FileId,
-    ) -> Union[
-        raw.types.InputPhotoFileLocation,
-        raw.types.InputDocumentFileLocation,
-        raw.types.InputPeerPhotoFileLocation,
-    ]:
-        """
-        Returns the file location for the media file.
-        """
+    async def get_location(file_id: FileId):
+        """Returns the file location for the media file."""
         file_type = file_id.file_type
 
         if file_type == FileType.CHAT_PHOTO:
@@ -151,13 +143,11 @@ class ByteStreamer:
         part_count: int,
         chunk_size: int,
     ):
-        """
-        Custom generator that yields the bytes of the media file.
-        """
+        """Custom generator that yields the bytes of the media file."""
         client = self.client
-        logger.debug(f"Starting to yield file with chunk size {chunk_size} for {part_count} parts")
-        media_session = await self.generate_media_session(client, file_id)
+        logger.debug(f"Starting to yield file with chunk size {chunk_size}")
 
+        media_session = await self.generate_media_session(client, file_id)
         current_part = 1
         location = await self.get_location(file_id)
 
@@ -165,35 +155,37 @@ class ByteStreamer:
             r = await media_session.invoke(
                 raw.functions.upload.GetFile(
                     location=location, offset=offset, limit=chunk_size
-                ),
+                )
             )
-            if isinstance(r, raw.types.upload.File):
-                while True:
-                    chunk = r.bytes
-                    if not chunk:
-                        break
-                    elif part_count == 1:
-                        yield chunk[first_part_cut:last_part_cut]
-                    elif current_part == 1:
-                        yield chunk[first_part_cut:]
-                    elif current_part == part_count:
-                        yield chunk[:last_part_cut]
-                    else:
-                        yield chunk
 
-                    current_part += 1
-                    offset += chunk_size
+            while True:
+                if not isinstance(r, raw.types.upload.File) or not r.bytes:
+                    break
 
-                    if current_part > part_count:
-                        break
+                chunk = r.bytes
+                if part_count == 1:
+                    yield chunk[first_part_cut:last_part_cut]
+                elif current_part == 1:
+                    yield chunk[first_part_cut:]
+                elif current_part == part_count:
+                    yield chunk[:last_part_cut]
+                else:
+                    yield chunk
 
-                    r = await media_session.invoke(
-                        raw.functions.upload.GetFile(
-                            location=location, offset=offset, limit=chunk_size
-                        ),
+                current_part += 1
+                offset += chunk_size
+
+                if current_part > part_count:
+                    break
+
+                r = await media_session.invoke(
+                    raw.functions.upload.GetFile(
+                        location=location, offset=offset, limit=chunk_size
                     )
+                )
+
         except (TimeoutError, AttributeError) as e:
-            logger.warning(f"Timeout or attribute error during file streaming: {e}")
+            logger.warning(f"Timeout/Attribute error during streaming: {e}")
             raise
         except Exception as e:
             logger.error(f"Unexpected error during file streaming: {e}")
@@ -202,9 +194,7 @@ class ByteStreamer:
             logger.debug(f"Finished yielding file with {current_part-1} parts.")
 
     async def clean_cache(self) -> None:
-        """
-        function to clean the cache to reduce memory usage
-        """
+        """Periodically clean cache to reduce memory usage"""
         while True:
             await asyncio.sleep(self.clean_timer)
             cache_size = len(self.cached_file_ids)
